@@ -1,0 +1,304 @@
+---
+title: "Weight Lifting Prediction"
+author: "davegoblue"
+date: "April 22, 2016"
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+## Executive Summary  
+Six test subjects lifted weights using five styles (A for correct, B-E for common error types) during an HAR (Human Activity Recognition) experiment.  Multiple attributes (positions, accelerations, Euler angles) were sampled from wearable technology while each subject performed each exercise style multiple times (see <http://groupware.les.inf.puc-rio.br/har>).
+  
+Random forests using 10-fold cross-validation perform well in predicting style (A-E) with this data.  A random forest using all positions, accelerations, and Euler angles achieves 99.3% accuracy in out-of-sample predictions.  Varying the predictors to be very sparse (3 sensors) or to take full advantage of structure intrinsic to the experiment changes the accuracy of out-of-sample predictions by roughly +/- 0.6%.
+  
+At the conclusion, we were asked to predict the style for a set of 20 data points.  The model described in the main body agrees with two alternate models (Appendix only) as to style for each of the 20 data points.  
+
+## Data Loading, Preparation, and Cleaning  
+###_Data Loading_  
+Data were downloaded as provided by the instructions in "Practical Machine Learning", a Coursera module created by JHU.  The analysis data set is "pml-training.csv" while "pml-testing.csv" contains the 20 data points that we are asked to predict for the quiz.  See Appendix 4 for verbose download code (only CSV read shown here).  
+```{r, echo=FALSE}
+if (file.exists("pml-training.csv") & file.exists("pml-testing.csv")) {
+    print("Using existing versions of pml-training.csv and pml-testing.csv")
+    print(file.info("pml-training.csv")[c("size","mode","mtime")])
+    print(file.info("pml-testing.csv")[c("size","mode","mtime")])
+} else {
+    print("Downloading versions of pml-training.csv and pml-testing.csv")
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  destfile="pml-training.csv"
+                  )
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                  destfile="pml-testing.csv"
+                  )
+}
+```
+  
+```{r}
+pml_training <- read.csv("pml-training.csv", stringsAsFactors=FALSE, na.strings=c("NA",""))
+pml_testing <- read.csv("pml-testing.csv", stringsAsFactors=FALSE, na.strings=c("NA",""))
+
+dim(pml_training); dim(pml_testing)
+identical(names(pml_training)[1:159], names(pml_testing)[1:159])
+print(paste0("Divergent names in column 160 are ",names(pml_training)[160],
+             " in training and ",names(pml_testing)[160]," in testing"))
+```
+
+The data sets each have 160 columns, and columns 1-159 have the same variable names.  The final column contains the type we want to predict ("classe") in the main data set, and is a placeholder in the 20-observation set.  The predictive process will focus on pml_training.  
+  
+###_Data Preparation (Test and Training Data Split)_  
+The caret library is loaded (along with randomForest, for use later), and the main data set is split such that 75% of observations are available for modelling with 25% held back to validate model prediction accuracy.  
+```{r}
+library(caret, quietly=TRUE, warn.conflicts=FALSE)
+library(randomForest, quietly=TRUE, warn.conflicts=FALSE)
+set.seed(0418161225)
+
+inTrain <- createDataPartition(y=pml_training$classe, p=0.75, list=FALSE)
+dfTrain <- pml_training[inTrain, ]
+dfValidate <- pml_training[-inTrain, ]
+
+dim(dfTrain); dim(dfValidate)
+table(dfTrain$classe)
+```
+  
+###_Data Cleaning (Managing NA)_  
+The data have significant proportions of NA, though these are fortunately concentrated by column.  As such, removing all columns with significant volumes of NA eliminates any need to impute missing values.  A new data set noNATrain is created by excluding all columns containing any NA.  
+```{r}
+naColSum <- colSums(is.na(dfTrain))
+okCol <- which(naColSum==0) ## Use only the 0 NA columns
+table(naColSum) ## All columns have either 0 NA or 14,409 (~97% of rows) NA
+noNATrain <- dfTrain[,okCol] ; dim(noNATrain) ## 60 variables with no NA
+```
+  
+## Analysis (Exploratory, Modeling)  
+###_Exploratory Data Analysis (Variable Inclusion)_  
+Quick inspection shows several variables are intrinsic to either this specific experiment or to the storage method for this specific data:  
+  
+* X - an index that is perfectly correlated to style (data were sorted by style before X was created)  
+* User Name - the six test subjects for this experiment (zero predictive power to future)  
+* Timestamps (3) - dates and times when this experiment was run (zero predictive power to future)  
+* Window (2) - roughly, sampling intervals for this experiment (very risky as a predictor for future experiments)  
+  
+For example (each color is a unique exercise type - see Appendix 4 for plotting code):  
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+plot(noNATrain$X, as.factor(noNATrain$cvtd_timestamp), col=as.factor(noNATrain$classe), 
+     main="Structure (example 1)")
+plot(y=noNATrain$raw_timestamp_part_1, x=noNATrain$num_window, ylim=c(1322489605, 1322489730),
+     col=as.factor(noNATrain$classe), main="Structure (example 2)")
+par(mfrow=c(1,1))
+```
+  
+Potential predictors are split in two groups, one using only data that could likely be reproduced in other experiments (positions, accelerations, Euler angles) and another that leverages structure intrinsic to this experiment.  Both predictor variable sets discard X and the character version of the timestamp.  The outcomes we want to predict ("classe") are converted to a factor and stored separately.  
+```{r}
+badAll <- c("X", "cvtd_timestamp", "classe") ## Do not use outcome as predictor either
+badStruct <- c("user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "new_window", "num_window")
+
+predictorsLimit <- noNATrain[,!(names(noNATrain) %in% c(badAll, badStruct))]
+predictorsFull <- noNATrain[,!(names(noNATrain) %in% c(badAll))]
+outcomes <- as.factor(noNATrain$classe) ## Factor will be easier for prediction
+dim(predictorsLimit) ; dim(predictorsFull) ; length(outcomes)
+```
+  
+###_Exploratory Data Analysis (Model Type)_  
+Exploratory plotting shows promise, as certain combinations of variables tend to be highly associated with the presence and/or absence of certain exercise types.  For example (see Appendix 4 for code):  
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+plot(predictorsLimit$yaw_belt, predictorsLimit$pitch_belt, col=outcomes, cex=0.25)
+legend("topright",legend=LETTERS[1:5],col=1:5,pch=19)
+plot(predictorsLimit$roll_belt, predictorsLimit$roll_forearm, col=outcomes, cex=0.25)
+legend("top",legend=LETTERS[1:5],col=1:5,pch=19)
+par(mfrow=c(1,1))
+```
+  
+While the relationships appear reasonably strong, they are decidedly non-linear.  As such, random forest will be pursued as the primary predictive technique.  This obviates the need for outlier removal, as random forest is largely insensitive to monotonic transforms of the inputs.  
+  
+###_Random Forest Modeling_  
+Random forests are generated using the narrower predictor set without structural information intrinsic to this experiment.  In the interest of balancing accuracy and speed, parameters are set for 10-fold cross-validation rather than the more computationally expensive 25-resample bootstrap default.  Further, the excellent multiple workers idea for parallel processing is adapted from  <https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md>  
+  
+```{r, cache=TRUE}
+## Set up the multiple workers
+library(parallel, quietly=TRUE, warn.conflicts=FALSE)
+library(doParallel, quietly=TRUE, warn.conflicts=FALSE)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+## Configure train control for 10-fold cross-validation with parallel processing
+parControl <- trainControl(method="cv", number=10, allowParallel = TRUE)
+
+## Run the random forest models
+rfLimit <- train(predictorsLimit, outcomes, method="rf", trControl=parControl)
+
+## Release the workers and allow the computer to revert to sequential
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+Summary statistics were generated, and the predictions were tested on the validation data.  See Appendix 3 for the more verbose outputs of the random forest and predictions on the validation data:  
+```{r}
+## Predicted out-of-sample accuracy based on 10-fold cross-validation
+round(rfLimit$results[rfLimit$results$mtry==rfLimit$bestTune[[1]],],3)
+
+## Out-of-sample accuracy based on applying model against the validation (holdout) data
+predLimit <- predict(rfLimit, dfValidate[,okCol])
+round(caret::confusionMatrix(predLimit, dfValidate$classe)$overall[c(1,3:5)],3)
+```
+  
+The mtry parameter of 2 was selected by train() to maximize accuracy.  Predicted out-of-sample accuracy based on 10-fold cross-validation has mean 99.3% with standard deviation 0.2% (95% CI roughly 89.9%-99.7% using a 2-sigma approximation).  This is consistent with the actual accuracy of 99.3% (95% CI 99.0%-99.5%) observed when applying the model to make predictions on the validation (holdout) dataset.  
+
+While various model improvements could be considered (e.g., a search grid that looks closer to mtry=7 may increase accuracy by a few tenths of a percent), the main objective was to hit 99%+ accuracy in pursuit of answering 19+ of 20 quiz predictions correctly.  As such, this model is used to answer the prediction quiz questions, without need for further computational expense:  
+  
+```{r}
+quizPredsLimit <- predict(rfLimit, pml_testing[,okCol])
+quizPredsLimit
+round(pbinom(15:19,20,.993,lower.tail=FALSE),3)
+```
+  
+If 20 quiz questions are iid from the same population as the modeling data, the binomial distribution predicts an 87% chance of scoring 20/20, a 99% chance of scoring 19+/20, and a 100% chance of passing with 16+/20.  
+  
+## Conclusion  
+Random forests achieve >99% accuracy when using posititions, accelerations, and Euler angles from wearable technology to predict the type of weight lifting using the data set provided for this exercise.
+
+Notably, all predictions are made where we know the sample is representative of the population (same test subjects, trainers, experimenters, etc.).  If this experiment is replicated, it is likely that the model will require additional calibration to maintain predictive power.  While we excluded a few variables that are highly instrinsic to the structure of this specific experiment, there is likely still some structure to positions, accelerations, and Euler angles based on how these individual test subjects, trainers, and experimenters performed on this specific day.
+
+Caveats aside, the random forest does an impressive job integrating multiple pieces of information (each with somewhat limited predictive power on its own) to make highly accurate predictions within this population.  
+  
+## Appendix  
+###_Appendix 1: Random Forest with only 9 variables_  
+For future replication, it may be helpful to have a model with a smaller number of variables that retains most of the accuracy.  This might allow researchers to get an early read on how similar a new population is to the existing population prior to running a full experiment.
+
+The variable importance of the final model was analyzed (see Appendix 3), and all components of three especially interesting variables (Euler belt, Euler forearm, dumbbell magnet position) were extracted and then run through a random forest.  The train controls (10-fold cross-validation with parallel processing) were maintained from the full model.  
+
+```{r, cache=TRUE}
+smallVars <- c("roll_belt", "pitch_belt", "yaw_belt", 
+               "roll_forearm", "pitch_forearm", "yaw_forearm",
+               "magnet_dumbbell_x", "magnet_dumbbell_y", "magnet_dumbbell_z"
+               )
+
+## Set up multiple workers
+library(parallel); library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+## Train random forest using same parameters as previous, including only these 9 variables
+rfSmall <- train(predictorsLimit[,smallVars], outcomes, method="rf", trControl=parControl)
+
+## Release the workers and resume sequential processing
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+  
+This set of 9 variables achieves predicted accuracy of 98.6% (standard deviation 0.3%) in the cross-validation and actual accuracy of 98.7% (95% CI 98.4%-99.0%) when applied to the validation (holdout) dataset.  It appears a reasonable trade-off of much improved interpretability and replicability in exchange for a modest loss of predictive power.  Further, it makes the same predictions as to the 20-question quiz.  
+  
+```{r}
+## Descriptive statistics about smaller model
+round(rfSmall$results[rfSmall$result$mtry==rfSmall$bestTune[[1]],],3)
+predSmall <- predict(rfSmall, dfValidate[,smallVars])
+round(caret::confusionMatrix(predSmall, dfValidate$classe)$overall[c(1,3:5)],3)
+
+## Quiz question predictions (comparison with main answer)
+quizPredsSmall <- predict(rfSmall, pml_testing[,smallVars])
+identical(quizPredsLimit, quizPredsSmall)
+```
+  
+  
+###_Appendix 2: Random Forest using structure intrinsic to this experiment_  
+Additionally, a model is run that takes full advantage of structure intrinsic to this experiment, specifically that runs of exercise styles were done sequentially by each participant (and are thus correlated with time).  While this may be of very limited if any use for making predictions anywhere other than within this dataset, it is included in the spirit of maximizing predictive power.  Note that "X" is still excluded, as it appears to be a spurious variable added after sorting by exercise type.  
+  
+```{r, cache=TRUE}
+
+## Set up multiple workers
+library(parallel); library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+## Convert characters to factors
+predictorsFull$user_name <- as.factor(predictorsFull$user_name)
+predictorsFull$new_window <- as.factor(predictorsFull$new_window)
+
+## Train random forest using same parameters as previous, including fullest set of variables
+rfFull <- train(predictorsFull, outcomes, method="rf", trControl=parControl)
+
+## Release the workers and resume sequential processing
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+  
+This master set of variables achieves predicted accuracy of 99.9% (standard deviation <0.1%) in the 10-fold  cross-validation and actual accuracy of 99.9% (95% CI 99.8%-100.0%) when applied to the validation (holdout) dataset.  While this slight increase in predictive power may be useful for this specific instance, the loss of replicability precludes selecting it as the final model.  Notably, it makes the same predictions as to the 20-question quiz, so failing to peek at structural artifacts does not impact the quiz score.  
+  
+```{r}
+## Update the validate data to also have factors for user_name and new_window
+factorValidate <- dfValidate[,okCol]
+factorValidate$user_name <- as.factor(factorValidate$user_name)
+factorValidate$new_window <- as.factor(factorValidate$new_window)
+
+## Descriptive statistics about fuller model
+round(rfFull$results[rfFull$results$mtry==rfFull$bestTune[[1]],],3)
+predFull <- predict(rfFull, factorValidate)
+round(caret::confusionMatrix(predFull, dfValidate$classe)$overall[c(1,3:5)],3)
+
+## Quiz question predictions (comparison with main answer)
+## Update the quiz data to also have factors for user_name and new_window
+factorQuiz <- pml_testing[,okCol]
+factorQuiz$user_name <- factor(factorQuiz$user_name, levels=levels(predictorsFull$user_name))
+factorQuiz$new_window <- factor(factorQuiz$new_window, levels=levels(predictorsFull$new_window))
+
+quizPredsFull <- predict(rfFull, factorQuiz)
+identical(quizPredsLimit, quizPredsFull)
+```
+  
+
+###_Appendix 3: Verbose Outputs of Primary Predictive Model_  
+```{r}
+## More verbose outputs of model used in analysis
+rfLimit
+caret::confusionMatrix(predLimit, dfValidate$classe)
+caret::varImp(rfLimit)
+
+```
+  
+  
+###_Appendix 4: Verbose R Code in Appendix to improve readability_  
+####_Download project files if needed_  
+```{r, eval=FALSE}
+## Code set to echo=FALSE in main document and eval=FALSE here
+if (file.exists("pml-training.csv") & file.exists("pml-testing.csv")) {
+    print("Using existing versions of pml-training.csv and pml-testing.csv")
+    print(file.info("pml-training.csv")[c("size","mode","mtime")])
+    print(file.info("pml-testing.csv")[c("size","mode","mtime")])
+} else {
+    print("Downloading versions of pml-training.csv and pml-testing.csv")
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  destfile="pml-training.csv"
+                  )
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                  destfile="pml-testing.csv"
+                  )
+}
+```
+  
+####_Plot data structure_  
+```{r, eval=FALSE}
+## Code set to echo=FALSE in main document and eval=FALSE here
+par(mfrow=c(1,2))
+plot(noNATrain$X, as.factor(noNATrain$cvtd_timestamp), col=as.factor(noNATrain$classe), 
+     main="Structure (example 1)")
+plot(y=noNATrain$raw_timestamp_part_1, x=noNATrain$num_window, ylim=c(1322489605, 1322489730),
+     col=as.factor(noNATrain$classe), main="Structure (example 2)")
+par(mfrow=c(1,1))
+```
+  
+####_Plot example predictors and outcomes_  
+```{r, eval=FALSE}
+## Code set to echo=FALSE in main document and eval=FALSE here
+par(mfrow=c(1,2))
+plot(predictorsLimit$yaw_belt, predictorsLimit$pitch_belt, col=outcomes, cex=0.25)
+legend("topright",legend=LETTERS[1:5],col=1:5,pch=19)
+plot(predictorsLimit$roll_belt, predictorsLimit$roll_forearm, col=outcomes, cex=0.25)
+legend("top",legend=LETTERS[1:5],col=1:5,pch=19)
+par(mfrow=c(1,1))
+```
+  
